@@ -18,9 +18,9 @@
 
 ## 关键目录（从入口到落盘）
 
-- CSV 解析：`src/execution/operator/csv_scanner/`
-- 表函数：`src/function/table/`
-- 存储：`src/storage/`
+- CSV 解析：`duckdb/src/execution/operator/csv_scanner/`
+- 表函数：`duckdb/src/function/table/`
+- 存储：`duckdb/src/storage/`
 
 ## 研究笔记
 
