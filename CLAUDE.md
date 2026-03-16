@@ -10,3 +10,9 @@
 参考文档：
 - 在线文档 https://duckdb.org/docs/current/
 - 离线文档 docs/duckdb-docs-v1.5.0.pdf
+
+## 目录结构
+
+- `docs`：项目文档
+- `source_code`：项目源码
+- `python`：生成的python脚本位置
