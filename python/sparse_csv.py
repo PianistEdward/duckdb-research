@@ -451,20 +451,20 @@ class SparseCSVReader:
                 newline="",
             ) as csvfile:
                 reader = csv.reader(csvfile, delimiter=self.config.delimiter)
-                rows = list(reader)
 
-                if not rows:
+                # 读取标题行
+                try:
+                    header = next(reader)
+                except StopIteration:
                     return
 
-                # 第一行作为表头
-                header = rows[0]
                 self._columns = header
 
                 # 上一行的展开值（用于继承）
                 prev_values: Optional[Dict[str, str]] = None
 
-                # 逐行处理
-                for row_idx, raw_row in enumerate(rows[1:], start=1):
+                # 逐行处理（真正的流式处理，不一次性加载到内存）
+                for row_idx, raw_row in enumerate(reader, start=1):
                     # 展开稀疏行
                     expanded = self._expand_sparse_row(raw_row, prev_values)
 
@@ -948,7 +948,6 @@ class SparseCSVReader:
         Yields:
             降采样后的行
         """
-        import random
         import math
 
         sample_size = config.sample_size
@@ -1214,21 +1213,22 @@ class SparseCSVWriter:
         """
         file_path = Path(file_path)
 
-        # 转换为列表以支持两次遍历（获取列名 + 写入数据）
-        # 注意：对于大数据集，这会增加内存占用
-        rows_list = list(rows)
-
-        if not rows_list:
-            # 空数据集，创建空文件
-            file_path.touch()
-            return 0
-
-        # 确定列顺序
-        if columns is None:
-            columns = list(rows_list[0].keys())
-
         # 确保目录存在
         file_path.parent.mkdir(parents=True, exist_ok=True)
+
+        # 如果未提供列名，需要从第一行获取
+        if columns is None:
+            # 转换为列表以获取列名（仅此情况需要）
+            rows_list = list(rows)
+            if not rows_list:
+                # 空数据集，创建空文件
+                file_path.touch()
+                return 0
+            columns = list(rows_list[0].keys())
+            rows_iter = iter(rows_list)
+        else:
+            rows_iter = iter(rows)
+            rows_list = None
 
         with file_path.open("w", encoding=self.config.encoding, newline="") as f:
             writer = csv.writer(
@@ -1241,17 +1241,23 @@ class SparseCSVWriter:
             if self.config.has_header:
                 writer.writerow(columns)
 
-            # 写入数据行
+            # 写入数据行（流式处理）
             row_count = 0
             prev_values: Optional[Dict[str, Any]] = None
+            has_data = False
 
-            for row in rows_list:
+            for row in rows_iter:
+                has_data = True
                 sparse_row = self._sparsify_row(row, prev_values, columns)
                 writer.writerow(sparse_row)
 
                 # 更新上一行值（存储实际值，用于下一行比较）
                 prev_values = {col: row.get(col) for col in columns}
                 row_count += 1
+
+        # 如果迭代器为空且未提供列名，删除空文件
+        if not has_data and rows_list is None:
+            file_path.touch()
 
         return row_count
 
