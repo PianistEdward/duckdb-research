@@ -7,21 +7,6 @@
 - 版本：DuckDB v1.5.0（源码研究）
 - 目标：CSV 稀疏存储特性（从解析 → 表函数 → 存储落盘的链路）
 
-参考文档：https://duckdb.org/docs/current/
-
-## 数据
-
-| 文件 | 说明 |
-|------|------|
-| `docs/csv-demo/normal.csv` | 常规 CSV |
-| `docs/csv-demo/sparse.csv` | 稀疏 CSV |
-
-## 关键目录（从入口到落盘）
-
-- CSV 解析：`duckdb/src/execution/operator/csv_scanner/`
-- 表函数：`duckdb/src/function/table/`
-- 存储：`duckdb/src/storage/`
-
-## 研究笔记
-
-- 详细文档：`docs/sparse-storage-research.md`
+参考文档：
+- 在线文档 https://duckdb.org/docs/current/
+- 离线文档 docs/duckdb-docs-v1.5.0.pdf
