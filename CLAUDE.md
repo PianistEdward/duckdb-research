@@ -16,3 +16,12 @@
 - `docs`：项目文档
 - `source_code`：项目源码
 - `python`：生成的python脚本位置
+
+## 文档
+
+- **稀疏存储研究**：`docs/sparse-storage-research.md`
+- **Python 模块 API**：`docs/python-module.md`
+
+## Python 模块
+
+`python/sparse_csv.py` 提供稀疏 CSV 处理功能，详见 `docs/python-module.md`

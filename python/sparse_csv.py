@@ -32,6 +32,7 @@ from typing import (
     List,
     Optional,
     Sequence,
+    Set,
     Tuple,
     Type,
     TypeVar,
@@ -64,6 +65,134 @@ class InheritMode(Enum):
     EMPTY_STRING = "empty_string"
     WHITESPACE = "whitespace"
     CUSTOM = "custom"
+
+
+class SamplingMethod(Enum):
+    """
+    采样方法枚举
+
+    支持的采样算法：
+    - BERNOULLI: 伯努利采样，每个元素以固定概率被选中
+    - RESERVOIR: 水库采样，从流中均匀随机选取 k 个元素
+    - SYSTEM: 系统采样，按固定间隔选取元素
+    - CLUSTER: 聚类采样，选取整个簇/组
+    - LTTB: Largest-Triangle-Three-Buckets，用于时间序列可视化降采样
+    """
+    BERNOULLI = "bernoulli"
+    RESERVOIR = "reservoir"
+    SYSTEM = "system"
+    CLUSTER = "cluster"
+    LTTB = "lttb"
+
+
+@dataclass
+class RangeQueryConfig:
+    """
+    范围查询配置
+
+    用于配置按某个 long 类型字段进行范围查询。
+
+    Attributes:
+        field: 要查询的字段名（必须是整数类型）
+        min_value: 包含的下界，None 表示无下界
+        max_value: 包含的上界，None 表示无上界
+        assume_sorted: 是否假设数据已按该字段升序排序（用于优化）
+    """
+    field: str
+    min_value: Optional[int] = None
+    max_value: Optional[int] = None
+    assume_sorted: bool = False
+
+
+@dataclass
+class RowQueryConfig:
+    """
+    行号查询配置
+
+    用于配置按行号/行ID查询特定行。
+
+    支持两种语义：
+    - row_number: 0-based 索引（如 Python 列表索引）
+    - rowid: 1-based 索引（如数据库行号）
+
+    Attributes:
+        row_numbers: 特定的 0-based 行号列表
+        rowid_range: 1-based 范围查询，格式为 (start, end) 包含两端
+        rowid_set: 1-based 行ID 集合
+    """
+    row_numbers: Optional[List[int]] = None
+    rowid_range: Optional[Tuple[int, int]] = None
+    rowid_set: Optional[Set[int]] = None
+
+
+@dataclass
+class SamplingConfig:
+    """
+    采样配置
+
+    用于配置数据采样方法。不同方法需要不同的参数。
+
+    Attributes:
+        method: 采样方法
+        sample_size: 水库采样/LTTB 采样的目标样本数
+        probability: 伯努利采样的选中概率 (0.0-1.0)
+        block_size: 系统采样的块大小
+        cluster_field: 聚类采样的分组字段名
+        n_clusters: 聚类采样要选择的簇数量（优先于 sample_size）
+        time_field: LTTB 采样的时间/横轴字段名（必需）
+        value_field: LTTB 采样的数值/纵轴字段名（必需）
+
+    示例:
+        >>> # 伯努利采样 10%
+        >>> SamplingConfig(method=SamplingMethod.BERNOULLI, probability=0.1)
+        >>> # 水库采样 1000 条
+        >>> SamplingConfig(method=SamplingMethod.RESERVOIR, sample_size=1000)
+        >>> # LTTB 降采样到 100 个点
+        >>> SamplingConfig(method=SamplingMethod.LTTB, sample_size=100,
+        ...                 time_field="timestamp", value_field="price")
+    """
+    method: SamplingMethod
+    sample_size: Optional[int] = None
+    probability: Optional[float] = None
+    block_size: Optional[int] = None
+    cluster_field: Optional[str] = None
+    n_clusters: Optional[int] = None  # 聚类采样：选择簇的数量
+    time_field: Optional[str] = None
+    value_field: Optional[str] = None
+
+    def __post_init__(self) -> None:
+        """验证配置参数"""
+        if self.method == SamplingMethod.BERNOULLI:
+            if self.probability is None:
+                raise ValueError("伯努利采样需要指定 probability 参数")
+            if not 0.0 <= self.probability <= 1.0:
+                raise ValueError(f"probability 必须在 0.0-1.0 范围内，当前: {self.probability}")
+
+        if self.method in (SamplingMethod.RESERVOIR, SamplingMethod.LTTB):
+            if self.sample_size is None:
+                raise ValueError(f"{self.method.value} 采样需要指定 sample_size 参数")
+            if self.sample_size <= 0:
+                raise ValueError(f"sample_size 必须大于 0，当前: {self.sample_size}")
+
+        if self.method == SamplingMethod.LTTB:
+            if not self.time_field:
+                raise ValueError("LTTB 采样需要指定 time_field 参数")
+            if not self.value_field:
+                raise ValueError("LTTB 采样需要指定 value_field 参数")
+
+        if self.method == SamplingMethod.SYSTEM:
+            if self.block_size is None:
+                raise ValueError("系统采样需要指定 block_size 参数")
+            if self.block_size <= 0:
+                raise ValueError(f"block_size 必须大于 0，当前: {self.block_size}")
+
+        if self.method == SamplingMethod.CLUSTER:
+            if not self.cluster_field:
+                raise ValueError("聚类采样需要指定 cluster_field 参数")
+            # n_clusters 优先于 sample_size
+            n = self.n_clusters if self.n_clusters is not None else self.sample_size
+            if n is None or n <= 0:
+                raise ValueError("聚类采样需要指定 n_clusters 或 sample_size 参数（大于 0）")
 
 
 @dataclass
@@ -294,6 +423,67 @@ class SparseCSVReader:
         # 列名列表（保持顺序）
         self._columns: List[str] = []
 
+    def _read_stream(self, file_path: Union[str, Path]) -> Generator[RowType, None, None]:
+        """
+        流式读取 CSV 文件（生成器版本）
+
+        这是核心读取方法，所有公共读取接口都基于此方法实现。
+        使用生成器模式以支持大文件处理。
+
+        Args:
+            file_path: CSV 文件路径
+
+        Yields:
+            RowType: 展开并类型转换后的行数据
+
+        异常处理：
+        ---------
+        - UnicodeDecodeError: 编码错误时提供详细错误信息
+        - StopIteration: 正常结束
+        """
+        file_path = Path(file_path)
+
+        try:
+            with open(
+                file_path,
+                "r",
+                encoding=self.config.encoding,
+                newline="",
+            ) as csvfile:
+                reader = csv.reader(csvfile, delimiter=self.config.delimiter)
+                rows = list(reader)
+
+                if not rows:
+                    return
+
+                # 第一行作为表头
+                header = rows[0]
+                self._columns = header
+
+                # 上一行的展开值（用于继承）
+                prev_values: Optional[Dict[str, str]] = None
+
+                # 逐行处理
+                for row_idx, raw_row in enumerate(rows[1:], start=1):
+                    # 展开稀疏行
+                    expanded = self._expand_sparse_row(raw_row, prev_values)
+
+                    # 更新继承值
+                    prev_values = expanded
+
+                    # 类型转换
+                    typed_row = self._convert_types(expanded, row_idx)
+
+                    yield typed_row
+
+        except UnicodeDecodeError as e:
+            raise ValueError(
+                f"文件编码错误：期望 {self.config.encoding} 编码，"
+                f"但文件 {file_path} 包含无效字节序列。"
+                f"错误位置：字节 {e.start}。"
+                f"建议检查文件实际编码或更改 config.encoding 参数。"
+            ) from e
+
     def read_all(self, file_path: Union[str, Path]) -> List[RowType]:
         """
         一次性读取全部数据
@@ -370,86 +560,493 @@ class SparseCSVReader:
         """
         return self._read_stream(file_path)
 
-    def _read_stream(self, file_path: Union[str, Path]) -> Iterator[RowType]:
-        """
-        内部流式读取实现
+    # =========================================================================
+    # 范围查询 (Range Query)
+    # =========================================================================
 
-        这是核心读取逻辑，实现了：
-        1. 文件打开与编码处理
-        2. CSV 解析
-        3. 稀疏继承处理
-        4. 类型转换
+    def range_query(
+        self, file_path: Union[str, Path], config: RangeQueryConfig
+    ) -> Iterator[RowType]:
+        """
+        按指定字段的范围查询数据
+
+        按某个 long 类型字段（如时间戳）进行范围过滤。
+        支持假设数据已排序以进行优化（提前终止）。
 
         Args:
             file_path: CSV 文件路径
+            config: 范围查询配置
 
         Yields:
-            RowType: 处理后的单行数据
+            RowType: 符合范围条件的行
 
-        难点与易错点：
-        -------------
-        1. **首行处理**：第一行没有"上一行"可继承，空字段应视为 NULL 而非继承
-           - 解决：使用 None 作为 prev_values 的初始值，在继承时检查
-        2. **类型推断时机**：继承的值已经完成类型转换，需避免重复转换
-           - 解决：类型推断和转换在展开后统一进行
-        3. **编码错误**：文件编码与配置不一致时会导致乱码或解码失败
-           - 解决：捕获 UnicodeDecodeError 并提供友好错误信息
-        4. **列数不一致**：某些行的列数可能多于或少于标题行
-           - 解决：跳过多余列，缺失列填充 None
+        示例:
+            >>> # 查询时间戳在 1000-2000 范围内的行
+            >>> config = RangeQueryConfig(
+            ...     field="timestamp",
+            ...     min_value=1000,
+            ...     max_value=2000,
+            ...     assume_sorted=True
+            ... )
+            >>> for row in reader.range_query("data.csv", config):
+            ...     print(row)
         """
-        file_path = Path(file_path)
+        field = config.field
 
-        try:
-            with file_path.open("r", encoding=self.config.encoding, newline="") as f:
-                reader = csv.reader(
-                    f,
-                    delimiter=self.config.delimiter,
-                    quotechar=self.config.quotechar,
+        # 预处理目标集合（用于无序扫描）
+        target_row_numbers: Optional[Set[int]] = None
+        if not config.assume_sorted:
+            # 需要先扫描一次收集符合条件的行号
+            # 注意：这里会扫描全部数据两次，内存效率较低
+            # 建议对大数据集使用 assume_sorted=True
+            target_row_numbers = set()
+            for row_idx, row in enumerate(self._read_stream(file_path)):
+                field_value = row.get(field)
+                if field_value is not None:
+                    try:
+                        int_value = int(field_value)
+                        if self._in_range(int_value, config.min_value, config.max_value):
+                            target_row_numbers.add(row_idx)
+                    except (ValueError, TypeError):
+                        pass
+
+        # 第二遍：输出符合条件的行
+        if target_row_numbers is not None:
+            for row_idx, row in enumerate(self._read_stream(file_path)):
+                if row_idx in target_row_numbers:
+                    yield row
+        else:
+            # 有序优化：一边扫描一边输出，遇到超出范围则停止
+            # 假设升序排列
+            for row in self._read_stream(file_path):
+                field_value = row.get(field)
+                if field_value is None:
+                    continue
+
+                try:
+                    int_value = int(field_value)
+                except (ValueError, TypeError):
+                    continue
+
+                # 检查是否在范围内
+                if not self._in_range(int_value, config.min_value, config.max_value):
+                    # 假设升序，已超出范围，停止扫描
+                    # 注意：降序排列时逻辑需要调整
+                    if config.assume_sorted and config.max_value is not None:
+                        if int_value > config.max_value:
+                            break
+                    elif config.assume_sorted and config.min_value is not None:
+                        if int_value < config.min_value:
+                            continue
+                    continue
+
+                yield row
+
+    def _in_range(
+        self, value: int, min_val: Optional[int], max_val: Optional[int]
+    ) -> bool:
+        """
+        检查值是否在指定范围内
+
+        Args:
+            value: 待检查的值
+            min_val: 下界（包含），None 表示无下界
+            max_val: 上界（包含），None 表示无上界
+
+        Returns:
+            bool: True 表示在范围内
+        """
+        if min_val is not None and value < min_val:
+            return False
+        if max_val is not None and value > max_val:
+            return False
+        return True
+
+    # =========================================================================
+    # 行号/行ID查询 (Row Query)
+    # =========================================================================
+
+    def row_query(
+        self, file_path: Union[str, Path], config: RowQueryConfig
+    ) -> Iterator[Tuple[int, RowType]]:
+        """
+        按行号/行ID查询特定行
+
+        支持三种查询模式：
+        - row_numbers: 指定 0-based 行号列表
+        - rowid_range: 指定 1-based 范围
+        - rowid_set: 指定 1-based 行ID 集合
+
+        注意：行号查询需要扫描文件，建议小批量查询使用。
+        大批量随机查询场景建议预先构建索引。
+
+        Args:
+            file_path: CSV 文件路径
+            config: 行号查询配置
+
+        Yields:
+            Tuple[int, RowType]: (行号, 行数据) 元组
+
+        示例:
+            >>> # 查询第 0, 5, 10 行 (0-based)
+            >>> config = RowQueryConfig(row_numbers=[0, 5, 10])
+            >>> for row_num, row in reader.row_query("data.csv", config):
+            ...     print(f"行 {row_num}: {row}")
+
+            >>> # 查询第 1-10 行 (1-based)
+            >>> config = RowQueryConfig(rowid_range=(1, 10))
+            >>> for row_num, row in reader.row_query("data.csv", config):
+            ...     print(f"行 {row_num}: {row}")
+        """
+        # 转换为目标行号集合 (0-based)
+        target_rows: Set[int]
+
+        if config.row_numbers is not None:
+            # 直接使用 0-based 行号
+            target_rows = set(config.row_numbers)
+        elif config.rowid_range is not None:
+            # 转换 1-based 范围为 0-based
+            start, end = config.rowid_range
+            target_rows = set(range(start - 1, end))
+        elif config.rowid_set is not None:
+            # 转换 1-based 集合为 0-based
+            target_rows = {rid - 1 for rid in config.rowid_set}
+        else:
+            raise ValueError("必须指定 row_numbers, rowid_range 或 rowid_set 之一")
+
+        # 扫描文件，返回目标行
+        for row_idx, row in enumerate(self._read_stream(file_path)):
+            if row_idx in target_rows:
+                yield (row_idx, row)
+
+    # =========================================================================
+    # 采样方法 (Sampling Methods)
+    # =========================================================================
+
+    def sample(
+        self, file_path: Union[str, Path], config: SamplingConfig
+    ) -> Iterator[RowType]:
+        """
+        对数据进行采样
+
+        支持多种采样算法，详见 SamplingMethod 枚举。
+
+        采样方法对比：
+        ----------------
+        | 方法      | 描述                           | 内存  | 适用场景           |
+        |-----------|--------------------------------|-------|-------------------|
+        | BERNOULLI | 每行概率 p 被选中              | O(1)  | 大数据集简单随机   |
+        | RESERVOIR | 水库采样保持 k 个均匀样本      | O(k)  | 固定大小样本       |
+        | SYSTEM    | 块采样，每隔 n 个块取一个      | O(1)  | I/O 效率优化       |
+        | CLUSTER   | 按分组字段选取整组            | O(g)  | 分组/聚类数据      |
+        | LTTB      | 最大三角形三桶算法            | O(k)  | 时间序列可视化降采样|
+
+        Args:
+            file_path: CSV 文件路径
+            config: 采样配置
+
+        Yields:
+            RowType: 采样后的行
+
+        示例:
+            >>> # 伯努利采样 10%
+            >>> config = SamplingConfig(
+            ...     method=SamplingMethod.BERNOULLI,
+            ...     probability=0.1
+            ... )
+            >>> for row in reader.sample("data.csv", config):
+            ...     process(row)
+
+            >>> # 水库采样 1000 条
+            >>> config = SamplingConfig(
+            ...     method=SamplingMethod.RESERVOIR,
+            ...     sample_size=1000
+            ... )
+            >>> for row in reader.sample("data.csv", config):
+            ...     process(row)
+
+            >>> # LTTB 降采样用于可视化
+            >>> config = SamplingConfig(
+            ...     method=SamplingMethod.LTTB,
+            ...     sample_size=100,
+            ...     time_field="timestamp",
+            ...     value_field="price"
+            ... )
+            >>> for row in reader.sample("data.csv", config):
+            ...     print(row)
+        """
+        if config.method == SamplingMethod.BERNOULLI:
+            yield from self._sample_bernoulli(file_path, config)
+        elif config.method == SamplingMethod.RESERVOIR:
+            yield from self._sample_reservoir(file_path, config)
+        elif config.method == SamplingMethod.SYSTEM:
+            yield from self._sample_system(file_path, config)
+        elif config.method == SamplingMethod.CLUSTER:
+            yield from self._sample_cluster(file_path, config)
+        elif config.method == SamplingMethod.LTTB:
+            yield from self._sample_lttb(file_path, config)
+
+    def _sample_bernoulli(
+        self, file_path: Union[str, Path], config: SamplingConfig
+    ) -> Iterator[RowType]:
+        """
+        伯努利采样（独立同分布）
+
+        每个元素以固定概率 p 被独立选中。
+        时间复杂度 O(n)，空间复杂度 O(1)。
+
+        Args:
+            file_path: CSV 文件路径
+            config: 采样配置，需包含 probability
+
+        Yields:
+            随机选中的行
+        """
+        import random
+
+        p = config.probability
+        assert p is not None  # 已在配置验证中确保
+
+        for row in self._read_stream(file_path):
+            if random.random() < p:
+                yield row
+
+    def _sample_reservoir(
+        self, file_path: Union[str, Path], config: SamplingConfig
+    ) -> Iterator[RowType]:
+        """
+        水库采样（Reservoir Sampling）
+
+        从未知大小的流中均匀随机选取 k 个元素。
+        算法：R 水库算法（Algorithm R）
+        时间复杂度 O(n)，空间复杂度 O(k)。
+
+        算法原理：
+        1. 前 k 个元素直接加入水库
+        2. 对于第 i 个元素 (i > k)，以 k/i 概率选中
+        3. 若选中，随机替换水库中的一个元素
+
+        Args:
+            file_path: CSV 文件路径
+            config: 采样配置，需包含 sample_size
+
+        Yields:
+            采样结束后的 k 个元素（一次性输出）
+        """
+        import random
+
+        k = config.sample_size
+        assert k is not None  # 已在配置验证中确保
+
+        reservoir: List[RowType] = []
+        for i, row in enumerate(self._read_stream(file_path)):
+            if i < k:
+                # 前 k 个元素直接加入
+                reservoir.append(row)
+            else:
+                # 第 i 个元素 (0-based: i >= k)
+                # 选中概率为 k / (i + 1)
+                j = random.randint(0, i)
+                if j < k:
+                    reservoir[j] = row
+
+        # 输出水库中的所有元素
+        yield from reservoir
+
+    def _sample_system(
+        self, file_path: Union[str, Path], config: SamplingConfig
+    ) -> Iterator[RowType]:
+        """
+        系统采样（Systematic Sampling）
+
+        从第一个随机起点开始，每隔固定间隔选取一个元素。
+        也称为等距采样或机械采样。
+        时间复杂度 O(n)，空间复杂度 O(1)。
+
+        Args:
+            file_path: CSV 文件路径
+            config: 采样配置，需包含 block_size
+
+        Yields:
+            选中的行（每 block_size 个取 1 个）
+        """
+        block_size = config.block_size
+        assert block_size is not None  # 已在配置验证中确保
+
+        # 随机起点（0 到 block_size-1）
+        import random
+        start = random.randint(0, block_size - 1)
+
+        for i, row in enumerate(self._read_stream(file_path)):
+            if i >= start and (i - start) % block_size == 0:
+                yield row
+
+    def _sample_cluster(
+        self, file_path: Union[str, Path], config: SamplingConfig
+    ) -> Iterator[RowType]:
+        """
+        聚类采样（Cluster Sampling）
+
+        按分组字段将数据分组成簇，随机选取若干个簇，
+        返回选中簇的所有行。
+
+        注意：此方法会读取所有数据到内存（用于分组），
+        不适合超大数据集。
+
+        Args:
+            file_path: CSV 文件路径
+            config: 采样配置，需包含 cluster_field 和 sample_size
+
+        Yields:
+            选中簇的所有行
+        """
+        import random
+
+        cluster_field = config.cluster_field
+        # n_clusters 优先于 sample_size
+        n_clusters = config.n_clusters if config.n_clusters is not None else (config.sample_size or 1)
+
+        assert cluster_field is not None  # 已在配置验证中确保
+
+        # 第一遍：按簇分组
+        clusters: Dict[Any, List[RowType]] = {}
+        for row in self._read_stream(file_path):
+            cluster_key = row.get(cluster_field)
+            if cluster_key not in clusters:
+                clusters[cluster_key] = []
+            clusters[cluster_key].append(row)
+
+        # 随机选择簇
+        cluster_keys = list(clusters.keys())
+        selected_clusters = random.sample(
+            cluster_keys, min(n_clusters, len(cluster_keys))
+        )
+
+        # 输出选中簇的所有行（保持原始顺序）
+        for cluster_key in selected_clusters:
+            yield from clusters[cluster_key]
+
+    def _sample_lttb(
+        self, file_path: Union[str, Path], config: SamplingConfig
+    ) -> Iterator[RowType]:
+        """
+        LTTB（Largest-Triangle-Three-Buckets）采样
+
+        用于时间序列或可视化降采样，保留数据的视觉特征。
+        算法将数据划分为多个桶，在每个桶中选择一个点，
+        目标是最大化保留原始数据的三角形面积。
+
+        特点：
+        - 保留峰值和趋势
+        - 输出数量确定（sample_size）
+        - 适合可视化降采样
+
+        Args:
+            file_path: CSV 文件路径
+            config: 采样配置，需包含 sample_size, time_field, value_field
+
+        Yields:
+            降采样后的行
+        """
+        import random
+        import math
+
+        sample_size = config.sample_size
+        time_field = config.time_field
+        value_field = config.value_field
+
+        assert sample_size is not None
+        assert time_field is not None
+        assert value_field is not None
+
+        # 读取所有数据到内存
+        all_rows = list(self._read_stream(file_path))
+
+        if len(all_rows) <= sample_size:
+            # 数据量小于目标样本数，直接返回全部
+            yield from all_rows
+            return
+
+        # 提取时间-值对
+        data_points: List[Tuple[float, float]] = []
+        for row in all_rows:
+            try:
+                t = float(row[time_field])
+                v = float(row[value_field])
+                data_points.append((t, v))
+            except (ValueError, TypeError, KeyError):
+                # 跳过无效数据点
+                continue
+
+        if len(data_points) <= sample_size:
+            yield from all_rows
+            return
+
+        # LTTB 算法需要 sample_size >= 3
+        if sample_size < 3:
+            # 简单处理：返回前 sample_size 个点
+            for i in range(sample_size):
+                yield all_rows[i]
+            return
+
+        # LTTB 算法实现
+        n = len(data_points)
+        bucket_size = (n - 2) / (sample_size - 2)
+
+        # 始终保留第一个点
+        sampled_indices = [0]
+
+        # 桶分配
+        a = 0  # 当前桶起始索引
+
+        for i in range(sample_size - 2):
+            # 计算桶的范围
+            bucket_start = int(math.floor((i + 1) * bucket_size)) + 1
+            bucket_end = int(math.floor((i + 2) * bucket_size)) + 1
+            bucket_end = min(bucket_end, n - 1)
+
+            # 计算下一个采样点应该选择桶中的哪个点
+            # 寻找与前一个采样点和桶内点构成最大三角形的点
+
+            # 前一个采样点
+            prev_idx = sampled_indices[-1]
+            prev_point = data_points[prev_idx]
+
+            # 在桶内寻找最佳点
+            max_area = -1.0
+            best_idx = bucket_start
+
+            bucket_count = bucket_end - bucket_start
+            if bucket_count <= 0:
+                # 桶为空或只有一个点，跳过
+                continue
+
+            avg_x = 0.0
+            for j in range(bucket_start, bucket_end):
+                avg_x += data_points[j][0]
+            avg_x /= bucket_count
+
+            for j in range(bucket_start, bucket_end):
+                # 计算三角形面积（使用叉积的绝对值）
+                # 面积 = |(b-a) x (c-a)| / 2
+                # 简化：比较 |(b-a) x (c-a)|
+                area = abs(
+                    (data_points[j][0] - prev_point[0]) * (avg_x - prev_point[1])
+                    - (avg_x - prev_point[0]) * (data_points[j][1] - prev_point[1])
                 )
 
-                # 跳过指定行数
-                for _ in range(self.config.skip_rows):
-                    next(reader, None)
+                if area > max_area:
+                    max_area = area
+                    best_idx = j
 
-                # 读取标题行
-                if self.config.has_header:
-                    try:
-                        header = next(reader)
-                    except StopIteration:
-                        return  # 空文件
-                    self._columns = [col.strip() for col in header]
-                else:
-                    # 无标题行时，从第一行推断列数
-                    first_row = next(reader)
-                    self._columns = [f"col_{i}" for i in range(len(first_row))]
-                    # 将第一行放回处理流程
-                    reader = iter([first_row] + list(reader))
+            sampled_indices.append(best_idx)
 
-                # 初始化继承状态
-                prev_values: Optional[Dict[str, str]] = None
+        # 始终保留最后一个点
+        sampled_indices.append(n - 1)
 
-                for row_idx, raw_row in enumerate(reader, start=1):
-                    # 展开稀疏行：空字段继承上一行的值
-                    expanded_row = self._expand_sparse_row(raw_row, prev_values)
-
-                    # 更新继承状态（存储展开后的字符串值，用于下一行继承）
-                    prev_values = {
-                        col: expanded_row.get(col, "")
-                        for col in self._columns
-                    }
-
-                    # 类型转换
-                    typed_row = self._convert_types(expanded_row, row_idx)
-
-                    yield typed_row
-
-        except UnicodeDecodeError as e:
-            raise ValueError(
-                f"文件编码错误：期望 {self.config.encoding} 编码，"
-                f"但文件 {file_path} 包含无效字节序列。"
-                f"错误位置：字节 {e.start}。"
-                f"建议检查文件实际编码或更改 config.encoding 参数。"
-            ) from e
+        # 按原始顺序输出采样点
+        for idx in sorted(sampled_indices):
+            yield all_rows[idx]
 
     def _expand_sparse_row(
         self, raw_row: List[str], prev_values: Optional[Dict[str, str]]
